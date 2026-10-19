@@ -4,16 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'observe = reads only; test = arm once; continue = resume the existing test'
+        description: 'probe = no account; external = gated tick; observe = read; test = arm once; continue = resume'
         type: choice
-        options: [observe, test, continue]
-        default: observe
+        options: [probe, external, observe, test, continue]
+        default: probe
       baseline_reset:
         description: 'Optional fictional baseline, ISO 8601 with timezone, e.g. 2026-10-19T19:00:00+02:00'
         type: string
         default: ''
-  schedule:
-    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
 
 permissions:
   contents: read
@@ -24,20 +22,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  quota:
-    # No credential access, polling, or sending until explicitly armed.
-    # A manual observation does not arm the scheduled job.
+  controller:
+    # Runs on every external tick, without any ChatGPT or PAT secret.
     if: >-
       github.event.repository.private == false &&
-      github.ref_name == github.event.repository.default_branch &&
-      (github.event_name == 'workflow_dispatch' || vars.QUOTA_TEST_ARMED == 'true')
+      github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      mode: ${{ steps.gate.outputs.mode }}
+      run_quota: ${{ steps.gate.outputs.run_quota }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: gate
+        name: Route tick before accessing account credentials
+        env:
+          REQUEST_MODE: ${{ inputs.mode }}
+          BASELINE_RESET: ${{ inputs.baseline_reset }}
+          QUOTA_TEST_ARMED: ${{ vars.QUOTA_TEST_ARMED }}
+          QUOTA_OBSERVE_ENABLED: ${{ vars.QUOTA_OBSERVE_ENABLED }}
+        run: python3 scripts/scheduler_gate.py
+
+  quota:
+    needs: controller
+    if: needs.controller.outputs.run_quota == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     permissions:
       contents: write
     env:
       CODEX_CLI_VERSION: '0.159.2'
-      MODE: ${{ inputs.mode || 'continue' }}
+      MODE: ${{ needs.controller.outputs.mode }}
       BASELINE_RESET: ${{ inputs.baseline_reset }}
       QUOTA_TEST_ARMED: ${{ vars.QUOTA_TEST_ARMED }}
       CODEX_WARM_MODEL: ${{ vars.CODEX_WARM_MODEL || 'gpt-5.6-sol' }}
