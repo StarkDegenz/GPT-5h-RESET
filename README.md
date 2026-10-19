@@ -44,6 +44,41 @@ Une échéance fictive teste le recalage, pas un véritable reset mondial.
 La configuration des identifiants ci-dessous reste à faire à l'activation.
 Aucun identifiant de la session qui prépare ce dépôt n'est récupéré.
 
+## Déclenchement externe
+
+Le workflow ne dépend plus du cron natif GitHub, qui n'a produit aucun événement
+programmé lors de l'essai du 19 octobre. Un planificateur externe appelle toutes
+les cinq minutes l'API `workflow_dispatch` de `quota-test.yml`, avec `ref=main`.
+Le client externe reçoit un jeton GitHub distinct, limité à ce dépôt et à
+**Actions: read and write**, jamais les identifiants ChatGPT ni le jeton Secrets.
+
+Le mode d'entrée du planificateur est `external`. Un job de contrôle sans secret
+applique les variables suivantes avant de démarrer le job connecté :
+
+| QUOTA_TEST_ARMED | QUOTA_OBSERVE_ENABLED | Effet d'un appel external |
+| --- | --- | --- |
+| false ou absente | false ou absente | Témoin seulement, aucun accès au compte |
+| false | true | Lecture du quota, aucun message au modèle |
+| true | toute valeur valide | Reprise de l'essai existant en mode continue |
+
+Le mode `probe` force un témoin sans accès au compte, même si le test est armé.
+Le mode `observe` reste disponible pour une observation manuelle explicite.
+Les modes manuels `test` et `continue` exigent `QUOTA_TEST_ARMED=true` avant tout
+accès au compte. Ne jamais programmer `test` : ce mode est réservé à l'armement
+manuel unique et ne doit pas être répété. Une valeur de variable invalide bloque
+le contrôleur.
+
+La validation du nouveau planificateur doit vérifier plusieurs appels successifs
+et les résultats réellement terminés dans Actions, puis la lecture du quota en
+mode observation. L'acceptation HTTP du déclenchement ne prouve pas la réussite
+du job : activer les alertes d'échec/désactivation du service externe et vérifier
+les notifications d'échec GitHub Actions séparément. Le résumé de chaque run
+indique la réception UTC, le mode effectif et l'autorisation d'accès au compte.
+
+Un service externe ne garantit pas non plus une ponctualité absolue ; GitHub peut
+mettre les jobs en file. Après validation de l'infrastructure, l'envoi réel reste
+un essai distinct et unique, avec l'autorisation de 24 heures déjà décrite.
+
 ## Connexion sécurisée, au moment choisi
 
 Le code reprend l'idée du projet MIT
