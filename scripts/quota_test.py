@@ -19,6 +19,10 @@ class Blocked(RuntimeError):
     pass
 
 
+class AuthPersistenceBlocked(Blocked):
+    pass
+
+
 def iso(epoch):
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
@@ -242,13 +246,16 @@ class Codex:
         self.cwd = os.environ['CODEX_WORKDIR']
 
     def persist_auth(self):
-        result = subprocess.run(['gh', 'secret', 'set', 'CODEX_AUTH_JSON', '--repo',
-                                 os.environ['GITHUB_REPOSITORY']],
-                                input=self.auth_path.read_bytes(), stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=40,
-                                env={**os.environ, 'GH_TOKEN': os.environ['QUOTA_SECRETS_TOKEN']})
+        try:
+            result = subprocess.run(['gh', 'secret', 'set', 'CODEX_AUTH_JSON', '--repo',
+                                     os.environ['GITHUB_REPOSITORY']],
+                                    input=self.auth_path.read_bytes(), stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=40,
+                                    env={**os.environ, 'GH_TOKEN': os.environ['QUOTA_SECRETS_TOKEN']})
+        except subprocess.TimeoutExpired:
+            raise AuthPersistenceBlocked('Authentication write-back timed out; stop all account operations.') from None
         if result.returncode:
-            raise Blocked('Unable to persist authentication; stop before any further request.')
+            raise AuthPersistenceBlocked('Unable to persist authentication; stop before any further request.')
 
     def sample(self):
         before = self.auth_path.read_bytes()
@@ -288,7 +295,69 @@ class Codex:
             self.persist_auth()
 
 
-def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep):
+VERIFY_OFFSETS = (15, 30, 60, 120)
+
+
+def record_pair(store, state, phase, first, second, decision):
+    """Keep bounded, allowlisted diagnostics; never store raw backend responses."""
+    entry = {'phase': phase, 'decision': decision,
+             'first_at': int(first.at), 'first_reset': first.reset,
+             'second_at': int(second.at), 'second_reset': second.reset,
+             'allowed': first.allowed and second.allowed}
+    if state.get('attempt_at') is not None:
+        entry['since_attempt_seconds'] = int(second.at - state['attempt_at'])
+    state['observations'] = [*state.get('observations', []), entry][-400:]
+    state['last_check_at'] = int(second.at)
+    state['last_trigger'] = os.environ.get('GITHUB_EVENT_NAME', 'local')
+    store.save(state)
+
+
+def verify_attempt(store, codex, state, expected_account, sleep, clock):
+    """Retry quota reads only. A second model call is never made here."""
+    started = clock()
+    expected = state['attempt_at'] + 18000
+    for offset in VERIFY_OFFSETS:
+        # Offsets are measured after CLI return; slow reads can overrun a target.
+        sleep(max(0, offset - (clock() - started)))
+        try:
+            first, second = codex.pair()
+        except AuthPersistenceBlocked:
+            # An unsaved token rotation must stop all further account operations.
+            raise
+        except (Blocked, subprocess.TimeoutExpired):
+            # Avoid persisting raw errors, which can carry authentication data.
+            state['verification_read_errors'] = state.get('verification_read_errors', 0) + 1
+            store.save(state)
+            print(f'Post-send target +{offset}s: quota read unavailable; no resend.')
+            continue
+        if first.account != expected_account or second.account != expected_account:
+            state['status'] = 'unverified'
+            state['verification_failure'] = 'account_changed'
+            store.save(state)
+            raise Blocked('Account changed after the request. No second request will be sent.')
+        try:
+            kind = classify(first, second)
+        except Blocked:
+            kind = 'ambiguous'
+        record_pair(store, state, 'after_send', first, second, kind)
+        print(f'Post-send target +{offset}s: {kind}; deadline UTC: {iso(second.reset)}')
+        if kind == 'active' and abs(second.reset - expected) <= 180:
+            state['status'] = 'complete'
+            state['verified_reset'] = second.reset
+            state['verified_at'] = int(second.at)
+            state['verification_offset_seconds'] = offset
+            store.save(state)
+            print('One-shot test complete: a stable five-hour deadline was observed after the request.')
+            print('Compare this deadline with the account UI; concurrent use cannot be ruled out by code.')
+            return 'complete'
+    state['status'] = 'unverified'
+    state['verification_failure'] = 'no_matching_stable_deadline'
+    store.save(state)
+    raise Blocked('Request attempted but window start unverified after four checks. No second request will be sent.')
+
+
+def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
+        clock=time.monotonic):
     state = store.load()
     if mode == 'test':
         if state.get('status') in ('pending', 'unverified', 'complete'):
@@ -304,8 +373,7 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep):
         store.save(state)
     first, second = codex.pair()
     updated, decision = decide(state, first, second)
-    if updated != state:
-        store.save(updated)
+    record_pair(store, updated, 'observation', first, second, decision)
     print(f'Observation: {decision}; observed deadline UTC: {iso(second.reset)}')
     if updated.get('resync_to') and updated.get('resync_to') != state.get('resync_to'):
         print(f'Realigned: {iso(updated["resync_from"])} -> {iso(updated["resync_to"])}')
@@ -319,6 +387,7 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep):
     # Re-read immediately before the irreversible step; user activity wins.
     before_first, before_second = codex.pair()
     updated, final_decision = decide(updated, before_first, before_second)
+    record_pair(store, updated, 'before_send', before_first, before_second, final_decision)
     if final_decision != 'due':
         store.save(updated)
         print('New activity or changed quota detected; request cancelled.')
@@ -328,24 +397,11 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep):
     updated['attempt_at'] = int(before_second.at)
     updated['attempt_id'] = os.environ.get('GITHUB_RUN_ID', 'local')
     store.save(updated)
-    cli_ok = codex.warm()
-    # A CLI error can occur after metering. Always observe, never blindly resend.
-    sleep(15)
-    after_first, after_second = codex.pair()
-    kind = classify(after_first, after_second)
-    expected = updated['attempt_at'] + 18000
-    if (kind == 'active' and after_second.account == before_second.account
-            and abs(after_second.reset - expected) <= 180):
-        updated['status'] = 'complete'
-        updated['verified_reset'] = after_second.reset
-        updated['cli_ok'] = cli_ok
-        store.save(updated)
-        print('One-shot test complete: a stable five-hour deadline was observed after the request.')
-        print('Compare this deadline with the account UI; concurrent use cannot be ruled out by code.')
-        return 'complete'
-    updated['status'] = 'unverified'
+    updated['cli_ok'] = codex.warm()
+    updated['cli_finished_at'] = int(time.time())
     store.save(updated)
-    raise Blocked('Request attempted but window start unverified. No second request will be sent.')
+    # A CLI error can occur after metering. Observe for delayed updates, never resend.
+    return verify_attempt(store, codex, updated, before_second.account, sleep, clock)
 
 
 def main():

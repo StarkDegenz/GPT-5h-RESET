@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'observe = reads only; test = arm ONE request after the observed expiry'
+        description: 'observe = reads only; test = arm once; continue = resume the existing test'
         type: choice
-        options: [observe, test]
+        options: [observe, test, continue]
         default: observe
       baseline_reset:
         description: 'Optional fictional baseline, ISO 8601 with timezone, e.g. 2026-10-19T19:00:00+02:00'
@@ -32,7 +32,7 @@ jobs:
       github.ref_name == github.event.repository.default_branch &&
       (github.event_name == 'workflow_dispatch' || vars.QUOTA_TEST_ARMED == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 12
     permissions:
       contents: write
     env:

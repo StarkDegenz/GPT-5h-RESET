@@ -2,7 +2,8 @@ import tempfile
 import sys
 import unittest
 
-from scripts.quota_test import AppServer, Blocked, Snapshot, classify, decide, parse_baseline, run
+from scripts.quota_test import (AppServer, AuthPersistenceBlocked, Blocked, Snapshot,
+                               classify, decide, parse_baseline, run)
 
 
 def pair(kind, at=100000, reset=None, allowed=True, account='account-hash'):
@@ -34,7 +35,10 @@ class FakeCodex:
         self.cli_ok = cli_ok
 
     def pair(self):
-        return next(self.observations)
+        observation = next(self.observations)
+        if isinstance(observation, Exception):
+            raise observation
+        return observation
 
     def warm(self):
         if self.store:
@@ -159,13 +163,92 @@ class QuotaTests(unittest.TestCase):
 
     def test_meter_does_not_change_blocks_future_attempts(self):
         store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
-        codex = FakeCodex([pair('idle'), pair('idle', at=100008), pair('idle', at=100030)], store)
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           *[pair('idle', at=at) for at in (100030, 100045, 100075, 100135)]], store)
         with self.assertRaises(Blocked):
             run(store, codex, 'continue', armed=True, sleep=lambda _: None)
         self.assertEqual(store.state['status'], 'unverified')
         next_codex = FakeCodex([pair('idle', at=100400)])
         self.assertEqual(run(store, next_codex, 'continue', armed=True), 'unverified')
         self.assertEqual(next_codex.sends, 0)
+
+    def test_delayed_deadline_is_verified_without_resending(self):
+        store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           pair('idle', at=100030), pair('idle', at=100045),
+                           pair('idle', at=100075),
+                           pair('active', at=100135, reset=118008)], store)
+        delays = []
+        self.assertEqual(run(store, codex, 'continue', armed=True,
+                             sleep=delays.append, clock=lambda: 0), 'complete')
+        self.assertEqual(delays, [15, 30, 60, 120])
+        self.assertEqual(codex.sends, 1)
+        self.assertEqual(store.state['verification_offset_seconds'], 120)
+        self.assertEqual(len([o for o in store.state['observations']
+                              if o['phase'] == 'after_send']), 4)
+
+    def test_post_send_read_error_can_recover_without_another_message(self):
+        store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           Blocked('private backend error must not be recorded'),
+                           pair('active', at=100050, reset=118008)], store)
+        self.assertEqual(run(store, codex, 'continue', armed=True,
+                             sleep=lambda _: None), 'complete')
+        self.assertEqual(codex.sends, 1)
+        self.assertEqual(store.state['verification_read_errors'], 1)
+        self.assertNotIn('private backend', str(store.state))
+
+    def test_auth_writeback_failure_stops_further_verification(self):
+        store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           AuthPersistenceBlocked('writeback failed')], store)
+        with self.assertRaises(AuthPersistenceBlocked):
+            run(store, codex, 'continue', armed=True, sleep=lambda _: None)
+        self.assertEqual(codex.sends, 1)
+        self.assertEqual(store.state['status'], 'pending')
+
+    def test_ambiguous_post_send_sample_can_settle(self):
+        store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
+        ambiguous = (Snapshot(100022, 117000, True, 'account-hash'),
+                     Snapshot(100030, 118008, True, 'account-hash'))
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008), ambiguous,
+                           pair('active', at=100050, reset=118008)], store)
+        self.assertEqual(run(store, codex, 'continue', armed=True,
+                             sleep=lambda _: None), 'complete')
+        self.assertEqual(codex.sends, 1)
+        self.assertEqual(store.state['observations'][-2]['decision'], 'ambiguous')
+
+    def test_post_send_different_account_never_validates(self):
+        store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           pair('active', at=100050, reset=118008, account='different')], store)
+        with self.assertRaises(Blocked):
+            run(store, codex, 'continue', armed=True, sleep=lambda _: None)
+        self.assertEqual(codex.sends, 1)
+        self.assertEqual(store.state['status'], 'unverified')
+        self.assertEqual(store.state['verification_failure'], 'account_changed')
+
+    def test_observation_history_is_bounded_and_keeps_existing_authorization(self):
+        store = Store({'armed_at': 90000, 'test_expires': 180000,
+                       'observations': [{'phase': 'old'}] * 400})
+        codex = FakeCodex([pair('active')])
+        run(store, codex, 'observe')
+        self.assertEqual(len(store.state['observations']), 400)
+        self.assertEqual(store.state['armed_at'], 90000)
+        self.assertEqual(store.state['test_expires'], 180000)
+        self.assertEqual(codex.sends, 0)
+
+    def test_verification_waits_only_until_next_target(self):
+        store = Store({'expected_reset': 99000, 'armed_at': 90000, 'test_expires': 180000})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           pair('idle', at=100030),
+                           pair('active', at=100050, reset=118008)], store)
+        clock = iter([0, 0, 23])
+        delays = []
+        run(store, codex, 'continue', armed=True, sleep=delays.append,
+            clock=lambda: next(clock))
+        self.assertEqual(delays, [15, 7])
+        self.assertEqual(codex.sends, 1)
 
     def test_restart_after_uncertain_attempt_never_repeats(self):
         for status in ('pending', 'unverified', 'complete'):
