@@ -166,6 +166,35 @@ Le backend et ses champs peuvent changer : une réponse inconnue bloque le test.
 - Les tâches publiques peuvent être désactivées après 60 jours sans activité.
   Ce test de 24 heures n'a pas besoin de heartbeat.
 
+## Notifications Telegram
+
+Le workflow séparé `telegram-alerts.yml` observe la fin des contrôles sans accéder
+aux secrets ChatGPT ni modifier l’essai. Il est inactif tant que les secrets
+`TELEGRAM_BOT_TOKEN` et `TELEGRAM_CHAT_ID` sont absents. Les destinataires sont
+limités à une conversation privée associée par un lien de démarrage unique.
+
+Créer un bot via le compte officiel [BotFather](https://t.me/BotFather), puis
+lancer `python3 scripts/configure_telegram.py` dans un terminal de confiance avec
+`gh` connecté au dépôt. La saisie du jeton est masquée ; il est transmis seulement
+à l’API Telegram et aux secrets GitHub, sans écriture locale. Le script vérifie le
+bot, refuse un webhook existant, affiche un lien d’association et attend son
+ouverture depuis le compte destinataire. Une confirmation locale précède
+l’enregistrement et un message de test. Ne jamais coller le jeton dans le chat,
+une URL de navigateur, un commit ou une commande shell.
+
+Alertes : début d’un incident GitHub, rétablissement, puis résultat confirmé ou
+incertain d’un essai. Les contrôles normaux restent silencieux. La branche
+`telegram-notification-state` conserve uniquement la déduplication et les IDs de
+runs publics, sans jeton ni destinataire. Une ambiguïté réseau après livraison
+peut entraîner un doublon ; un échec du canal Telegram apparaît dans Actions.
+La réception réelle doit être vérifiée après association et déploiement.
+
+Ce canal ne détecte pas encore un arrêt complet des déclenchements, puisqu’il
+dépend de la fin d’un workflow GitHub. Conserver les alertes email cron-job.org ;
+un contrôle indépendant du silence reste à ajouter pour une exploitation
+permanente. Le bot est réutilisable par d’autres tâches pour des notifications,
+mais aucun interpréteur de commandes Telegram n’est installé.
+
 ## Tests locaux sans compte
 
 ```sh
