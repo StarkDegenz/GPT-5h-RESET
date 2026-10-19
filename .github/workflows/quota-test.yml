@@ -1,0 +1,101 @@
+name: Codex quota test (disabled by default)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'observe = reads only; test = arm ONE request after the observed expiry'
+        type: choice
+        options: [observe, test]
+        default: observe
+      baseline_reset:
+        description: 'Optional fictional baseline, ISO 8601 with timezone, e.g. 2026-10-19T19:00:00+02:00'
+        type: string
+        default: ''
+  schedule:
+    - cron: '2-57/5 * * * *'
+
+permissions:
+  contents: read
+
+# Queued runs re-read durable state. Never cancel a request while it is in flight.
+concurrency:
+  group: codex-quota-controller
+  cancel-in-progress: false
+
+jobs:
+  quota:
+    # No credential access, polling, or sending until explicitly armed.
+    # A manual observation does not arm the scheduled job.
+    if: >-
+      github.event.repository.private == false &&
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'workflow_dispatch' || vars.QUOTA_TEST_ARMED == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    env:
+      CODEX_CLI_VERSION: '0.159.2'
+      MODE: ${{ inputs.mode || 'continue' }}
+      BASELINE_RESET: ${{ inputs.baseline_reset }}
+      QUOTA_TEST_ARMED: ${{ vars.QUOTA_TEST_ARMED }}
+      CODEX_WARM_MODEL: ${{ vars.CODEX_WARM_MODEL || 'gpt-5.6-sol' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Local tests (no account access)
+        run: python3 -m unittest discover -s tests -v
+      - name: Set isolated runtime paths
+        run: |
+          echo "CODEX_HOME=$RUNNER_TEMP/quota-codex" >> "$GITHUB_ENV"
+          echo "CODEX_WORKDIR=$RUNNER_TEMP/quota-empty" >> "$GITHUB_ENV"
+      - name: Check prerequisites and restore the dedicated ChatGPT login
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          QUOTA_SECRETS_TOKEN: ${{ secrets.QUOTA_SECRETS_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          if not os.environ.get('QUOTA_SECRETS_TOKEN'):
+              raise SystemExit('Missing QUOTA_SECRETS_TOKEN (secure token write-back is required).')
+          try:
+              auth = json.loads(os.environ.get('CODEX_AUTH_JSON', ''))
+          except ValueError:
+              raise SystemExit('Missing or invalid CODEX_AUTH_JSON; no request sent.')
+          tokens = auth.get('tokens') or {}
+          if auth.get('OPENAI_API_KEY') or not all(tokens.get(k) for k in ('access_token', 'refresh_token', 'account_id')):
+              raise SystemExit('A dedicated ChatGPT login is required; API-key login is rejected.')
+          root = Path(os.environ['CODEX_HOME'])
+          root.mkdir(mode=0o700, parents=True, exist_ok=True)
+          p = root / 'auth.json'
+          p.touch(mode=0o600)
+          p.write_text(json.dumps(auth))
+          p.chmod(0o600)
+          Path(os.environ['CODEX_WORKDIR']).mkdir(parents=True, exist_ok=True)
+          PY
+      - name: Install pinned official Codex CLI
+        run: |
+          npm install --prefix "$RUNNER_TEMP/quota-cli" --no-audit --no-fund "@openai/codex@$CODEX_CLI_VERSION"
+          echo "$RUNNER_TEMP/quota-cli/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Read quota and run the guarded test
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUOTA_SECRETS_TOKEN: ${{ secrets.QUOTA_SECRETS_TOKEN }}
+        run: python3 scripts/quota_test.py
+      - name: Persist any refreshed authentication, including after failure
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.QUOTA_SECRETS_TOKEN }}
+        run: |
+          if [ -n "${CODEX_HOME:-}" ] && [ -s "$CODEX_HOME/auth.json" ] && [ -n "$GH_TOKEN" ]; then
+            gh secret set CODEX_AUTH_JSON --repo "$GITHUB_REPOSITORY" < "$CODEX_HOME/auth.json"
+          fi
+      - name: Remove local credentials
+        if: always()
+        run: |
+          if [ -n "${CODEX_HOME:-}" ]; then
+            rm -f "$CODEX_HOME/auth.json"
+          fi
