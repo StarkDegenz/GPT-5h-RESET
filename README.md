@@ -18,7 +18,10 @@ une tâche ou une conversation ChatGPT existante.
 5. Avant l'envoi, le programme relit le quota et enregistre une intention durable.
    Il lance au plus **un appel CLI** (le CLI peut lui-même reconnecter ses
    transports), puis vérifie l'apparition d'une échéance stable d'environ cinq
-   heures. Les sorties du CLI ne sont pas publiées.
+   heures. Si nécessaire, il relit le quota aux cibles +15, +30, +60 et +120
+   secondes après le retour du CLI. Chaque contrôle utilise deux lectures
+   espacées de huit secondes et s'arrête dès confirmation. Une lecture lente
+   peut dépasser une cible. Les sorties du CLI ne sont pas publiées.
 6. Le test s'arrête après cet essai, même en cas de résultat incertain. Aucun
    deuxième message ni enchaînement permanent n'est activé.
 
@@ -83,16 +86,30 @@ Le backend et ses champs peuvent changer : une réponse inconnue bloque le test.
    programmés continuent le premier essai.
 4. Le journal `Realigned` doit montrer le remplacement de l'échéance fictive.
    Aucun envoi tant que la fenêtre reste active.
-5. Après l'essai, comparer `verified_reset`, dans `state.json` sur la branche
+5. Pour reprendre le même essai manuellement, utiliser `continue` sans baseline,
+   jamais `test` une deuxième fois. Cela ne renouvelle pas les 24 heures ni le droit
+   à un message. Si aucun événement `schedule` n'apparaît dans Actions, la cadence
+   automatique n'est pas validée, même si le lancement manuel fonctionne.
+6. Après l'essai, comparer `verified_reset`, dans `state.json` sur la branche
    `quota-test-state`, avec l'interface avant d'envoyer un autre message.
    L'échéance doit être environ cinq heures après l'envoi réel.
-6. Remettre `QUOTA_TEST_ARMED=false`. Reprendre le rappel si le test n'est pas
+7. Remettre `QUOTA_TEST_ARMED=false`. Reprendre le rappel si le test n'est pas
    retenu. Le mode permanent viendra seulement après validation de cet essai.
 
 ## Protections et limites
 
-- La branche `quota-test-state` conserve seulement échéances UTC, empreinte du
-  compte et statut. Aucun jeton, identifiant brut ou texte de réponse.
+- La branche `quota-test-state` conserve échéances UTC, empreinte du compte,
+  statut et au plus 400 observations assainies : horaires des deux lectures,
+  échéances, permission d'usage, phase et décision. `last_check_at` et
+  `last_trigger` permettent de distinguer lancement manuel et passage programmé.
+  Après envoi, elle conserve aussi le résultat CLI, l'heure de confirmation ou
+  une cause d'échec générique. Aucun jeton, identifiant brut, erreur backend brute
+  ou texte de réponse.
+- Les nouvelles lectures après envoi ne sont jamais de nouveaux messages.
+  Une mise à jour retardée ou temporairement ambiguë peut se stabiliser pendant
+  les quatre contrôles. Un changement de compte ou une sauvegarde OAuth impossible
+  bloque la suite. Sans confirmation, le statut reste bloquant et aucun deuxième
+  envoi n'est tenté.
 - Verrou global GitHub et relecture de l'état à chaque run. Une écriture impossible
   bloque l'envoi. `pending`, `unverified` et `complete` interdisent un nouvel essai,
   même après redémarrage ou lancement manuel.
