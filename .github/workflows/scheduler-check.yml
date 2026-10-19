@@ -1,0 +1,21 @@
+name: Scheduler diagnostic (no credentials)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
+
+permissions: {}
+
+jobs:
+  clock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Record trigger receipt without accessing the repository or account
+        env:
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          echo "Trigger received: $TRIGGER"
+          date -u '+Received UTC: %Y-%m-%dT%H:%M:%SZ'
+          echo 'This diagnostic does not check out code, read secrets, or contact ChatGPT.'
