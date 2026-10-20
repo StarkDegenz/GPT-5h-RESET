@@ -1,3 +1,28 @@
+# Contrôleur permanent des fenêtres Codex
+
+Le mode permanent est activé dans `quota-test.yml` avec
+`QUOTA_CONTINUOUS_ENABLED=true`. Le planificateur externe existant continue
+ses appels toutes les cinq minutes en mode `external`. `QUOTA_TEST_ARMED=true`
+reste nécessaire ; le mettre à `false` suspend les envois.
+
+Chaque cycle attend la fin de la fenêtre réellement observée puis au moins
+cinq minutes, relit le quota juste avant un seul message et vérifie la nouvelle
+échéance. Une fenêtre active démarrée par l’utilisateur est suivie sans envoi.
+Seul un cycle `complete` avec une confirmation et une échéance expirée peut
+être archivé pour le cycle suivant. Les 100 derniers reçus sont conservés dans
+`completed_cycles`. `pending` ou `unverified` bloque tout nouvel envoi et fait
+échouer le run pour rendre le problème visible. Aucun retry de message.
+
+L’autorisation de test de 24 heures ne limite plus le mode permanent. Le test
+manuel `test` est refusé tant que ce mode est activé. Les modes `probe` et
+`observe` gardent leur comportement sans envoi. Le rappel ChatGPT séparé lit
+`verified_reset` pour afficher la prochaine échéance confirmée en heure de Paris.
+GitHub et le planificateur externe peuvent retarder les passages ; leur cadence
+ne garantit pas une heure exacte. Notifications d’échec Actions à surveiller.
+
+Les notes ci-dessous décrivent le test initial et la configuration des secrets ;
+leurs restrictions « un seul essai / 24 heures » concernent le mode test uniquement.
+
 # Test des fenêtres Codex avec ChatGPT Plus
 
 **Préparation uniquement : aucun envoi activé par défaut.** Ce dépôt prépare un

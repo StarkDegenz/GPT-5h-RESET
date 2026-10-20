@@ -1,4 +1,4 @@
-name: Codex quota test (disabled by default)
+name: Codex quota controller
 
 on:
   workflow_dispatch:
@@ -53,6 +53,7 @@ jobs:
     permissions:
       contents: write
     env:
+      QUOTA_CONTINUOUS_ENABLED: 'true'
       CODEX_CLI_VERSION: '0.159.2'
       MODE: ${{ needs.controller.outputs.mode }}
       BASELINE_RESET: ${{ inputs.baseline_reset }}

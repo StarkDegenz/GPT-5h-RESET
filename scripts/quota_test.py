@@ -1,4 +1,4 @@
-"""One-shot quota experiment. No API keys; unknown states never permit a send."""
+"""Guarded quota controller. No API keys; unknown states never permit a send."""
 
 import base64
 from dataclasses import dataclass
@@ -85,6 +85,37 @@ def classify(first, second):
     if abs(movement - dt) <= 3 and 17880 <= remaining <= 18030:
         return 'idle'
     raise Blocked('Ambiguous quota transition; wait for another run, no send.')
+
+
+def advance_cycle(state, first, second):
+    """Retain the previous receipt; only retire a confirmed, expired cycle."""
+    state = dict(state)
+    if state.get('account') and state['account'] != second.account:
+        raise Blocked('Configured account differs from the saved experiment.')
+    kind = classify(first, second)
+    if state.get('status') in ('pending', 'unverified'):
+        raise Blocked('Previous request is unresolved; review state before any new request.')
+    if state.get('status') != 'complete':
+        return state
+    deadline = state.get('verified_reset')
+    if type(deadline) is not int or not state.get('verified_at'):
+        raise Blocked('Completed cycle has no verified receipt.')
+    if kind == 'active':
+        state['expected_reset'] = second.reset
+        state.pop('idle_since', None)
+        return state
+    if kind != 'idle' or first.at < deadline or second.at < deadline:
+        return state
+    fields = ('attempt_at', 'attempt_id', 'cli_ok', 'cli_finished_at',
+              'verified_at', 'verified_reset', 'verification_offset_seconds',
+              'verification_read_errors', 'verification_failure')
+    receipt = {key: state[key] for key in fields if key in state}
+    state['completed_cycles'] = [*state.get('completed_cycles', []), receipt][-100:]
+    for key in fields:
+        state.pop(key, None)
+    state['status'] = 'monitoring'
+    state.pop('idle_since', None)
+    return state
 
 
 def decide(state, first, second):
@@ -347,7 +378,7 @@ def verify_attempt(store, codex, state, expected_account, sleep, clock):
             state['verified_at'] = int(second.at)
             state['verification_offset_seconds'] = offset
             store.save(state)
-            print('One-shot test complete: a stable five-hour deadline was observed after the request.')
+            print('Cycle complete: a stable five-hour deadline was observed after the request.')
             print('Compare this deadline with the account UI; concurrent use cannot be ruled out by code.')
             return 'complete'
     state['status'] = 'unverified'
@@ -357,8 +388,10 @@ def verify_attempt(store, codex, state, expected_account, sleep, clock):
 
 
 def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
-        clock=time.monotonic):
+        clock=time.monotonic, continuous=False):
     state = store.load()
+    if continuous and mode == 'test':
+        raise Blocked('Disable continuous mode before arming a new one-shot test.')
     if mode == 'test':
         if state.get('status') in ('pending', 'unverified', 'complete'):
             raise Blocked('A request was already attempted; review its result before resetting state.')
@@ -372,6 +405,8 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
             state.pop('idle_since', None)
         store.save(state)
     first, second = codex.pair()
+    if continuous and mode == 'continue' and armed:
+        state = advance_cycle(state, first, second)
     updated, decision = decide(state, first, second)
     record_pair(store, updated, 'observation', first, second, decision)
     print(f'Observation: {decision}; observed deadline UTC: {iso(second.reset)}')
@@ -382,7 +417,7 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
     if not armed or not updated.get('armed_at'):
         print('Sending disabled. A manual test AND QUOTA_TEST_ARMED=true are required.')
         return 'disabled'
-    if second.at > updated['test_expires']:
+    if not continuous and second.at > updated['test_expires']:
         raise Blocked('The 24-hour test authorization expired; no request sent.')
     # Re-read immediately before the irreversible step; user activity wins.
     before_first, before_second = codex.pair()
@@ -412,7 +447,8 @@ def main():
     if baseline is not None and mode != 'test':
         raise Blocked('A fictional baseline is only accepted when arming the one-shot test.')
     run(GitHubState(), Codex(), mode, baseline,
-        armed=os.environ.get('QUOTA_TEST_ARMED') == 'true')
+        armed=os.environ.get('QUOTA_TEST_ARMED') == 'true',
+        continuous=os.environ.get('QUOTA_CONTINUOUS_ENABLED') == 'true')
 
 
 if __name__ == '__main__':

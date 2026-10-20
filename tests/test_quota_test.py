@@ -284,6 +284,67 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(store.state['expected_reset'], 101000)
         self.assertEqual(codex.sends, 0)
 
+    def test_continuous_waits_for_verified_window_then_sends_next_cycle(self):
+        store = Store({'status': 'complete', 'armed_at': 1, 'test_expires': 2,
+                       'verified_reset': 118008, 'verified_at': 100030,
+                       'attempt_at': 100008, 'attempt_id': 'previous',
+                       'expected_reset': 118008})
+        active = FakeCodex([pair('active', at=110000, reset=118008)])
+        self.assertEqual(run(store, active, 'continue', armed=True,
+                             continuous=True), 'complete')
+        self.assertEqual(active.sends, 0)
+        next_cycle = FakeCodex([pair('idle', at=118400),
+                               pair('idle', at=118408),
+                               pair('active', at=118430, reset=136408)], store)
+        self.assertEqual(run(store, next_cycle, 'continue', armed=True,
+                             continuous=True, sleep=lambda _: None), 'complete')
+        self.assertEqual(next_cycle.sends, 1)
+        self.assertEqual(store.state['verified_reset'], 136408)
+        self.assertEqual(store.state['completed_cycles'][0]['attempt_id'], 'previous')
+        self.assertEqual(store.state['completed_cycles'][0]['verified_reset'], 118008)
+        duplicate = FakeCodex([pair('active', at=118500, reset=136408)])
+        run(store, duplicate, 'continue', armed=True, continuous=True)
+        self.assertEqual(duplicate.sends, 0)
+
+    def test_continuous_uncertain_attempt_stays_blocked(self):
+        for status in ('pending', 'unverified'):
+            store = Store({'status': status, 'armed_at': 1})
+            codex = FakeCodex([pair('idle', at=200000)])
+            with self.assertRaises(Blocked):
+                run(store, codex, 'continue', armed=True, continuous=True)
+            self.assertEqual(codex.sends, 0)
+            self.assertEqual(store.state['status'], status)
+
+    def test_continuous_does_not_restart_before_confirmed_expiry(self):
+        store = Store({'status': 'complete', 'armed_at': 1,
+                       'verified_reset': 118008, 'verified_at': 100030})
+        codex = FakeCodex([pair('idle', at=110000)])
+        self.assertEqual(run(store, codex, 'continue', armed=True,
+                             continuous=True), 'complete')
+        self.assertEqual(codex.sends, 0)
+
+    def test_continuous_observation_and_disarmed_runs_do_not_retire_cycle(self):
+        for mode, armed in (('observe', True), ('continue', False)):
+            store = Store({'status': 'complete', 'armed_at': 1,
+                           'verified_reset': 118008, 'verified_at': 100030})
+            codex = FakeCodex([pair('idle', at=120000)])
+            run(store, codex, mode, armed=armed, continuous=True)
+            self.assertEqual(store.state['status'], 'complete')
+            self.assertEqual(codex.sends, 0)
+
+    def test_continuous_tracks_user_window_before_natural_expiry(self):
+        store = Store({'status': 'complete', 'armed_at': 1,
+                       'verified_reset': 118008, 'verified_at': 100030,
+                       'expected_reset': 118008})
+        codex = FakeCodex([pair('active', at=119000, reset=130000)])
+        run(store, codex, 'continue', armed=True, continuous=True)
+        self.assertEqual(store.state['expected_reset'], 130000)
+        idle = FakeCodex([pair('idle', at=130100)])
+        self.assertEqual(run(store, idle, 'continue', armed=True,
+                             continuous=True), 'waiting_five_minutes')
+        self.assertEqual(idle.sends, 0)
+        self.assertEqual(store.state['idle_since'], 130000)
+
     def test_app_server_protocol_handles_notifications(self):
         fake = '''import json, sys
 for line in sys.stdin:
