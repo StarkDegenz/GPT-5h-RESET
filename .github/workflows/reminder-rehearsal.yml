@@ -1,0 +1,37 @@
+name: TEST ONLY - reminder event transport
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reminder-rehearsal-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  emit-test-event:
+    if: >-
+      github.event.pull_request.draft == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'test/existing-chat-reset-rehearsal' &&
+      contains(fromJSON('["rehearsal-probe","rehearsal-early-reset","rehearsal-quota-observed"]'), github.event.label.name)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Regression tests without account access
+        run: python3 -m unittest discover -s tests -v
+      - name: Emit one labeled test event to the control PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_PR: ${{ github.event.pull_request.number }}
+          REHEARSAL_LABEL: ${{ github.event.label.name }}
+        run: python3 scripts/rehearsal_event.py
