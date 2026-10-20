@@ -102,6 +102,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           QUOTA_SECRETS_TOKEN: ${{ secrets.QUOTA_SECRETS_TOKEN }}
+          QUOTA_CHAT_ENABLED: ${{ vars.QUOTA_CHAT_ENABLED }}
+          QUOTA_CHAT_TRIGGER_ID: ${{ vars.QUOTA_CHAT_TRIGGER_ID }}
+          QUOTA_CHAT_CONVERSATION_KEY: ${{ vars.QUOTA_CHAT_CONVERSATION_KEY }}
+          QUOTA_CHAT_ACCESS_TOKEN: ${{ secrets.QUOTA_CHAT_ACCESS_TOKEN }}
         run: python3 scripts/quota_test.py
       - name: Persist any refreshed authentication, including after failure
         if: always()

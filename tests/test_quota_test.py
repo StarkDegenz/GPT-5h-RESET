@@ -315,13 +315,82 @@ class QuotaTests(unittest.TestCase):
             self.assertEqual(codex.sends, 0)
             self.assertEqual(store.state['status'], status)
 
-    def test_continuous_does_not_restart_before_confirmed_expiry(self):
+    def test_continuous_early_reset_waits_from_detection_then_starts_new_cycle(self):
         store = Store({'status': 'complete', 'armed_at': 1,
-                       'verified_reset': 118008, 'verified_at': 100030})
+                       'verified_reset': 118008, 'verified_at': 100030,
+                       'expected_reset': 118008})
         codex = FakeCodex([pair('idle', at=110000)])
         self.assertEqual(run(store, codex, 'continue', armed=True,
-                             continuous=True), 'complete')
+                             continuous=True), 'waiting_five_minutes')
         self.assertEqual(codex.sends, 0)
+        self.assertEqual(store.state['idle_since'], 110000)
+        next_codex = FakeCodex([pair('idle', at=110301), pair('idle', at=110309),
+                                pair('active', at=110331, reset=128309)], store)
+        self.assertEqual(run(store, next_codex, 'continue', armed=True,
+                             continuous=True, sleep=lambda _: None), 'complete')
+        self.assertEqual(next_codex.sends, 1)
+
+    def test_chat_trigger_then_confirmation_and_no_duplicate_on_next_tick(self):
+        class Chat:
+            events = []
+
+            def send(self, event):
+                self.events.append(dict(event))
+                return 'https://chatgpt.com/c/test-chat'
+
+        chat = Chat()
+        store = Store({'expected_reset': 99000, 'armed_at': 1})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           pair('active', at=100030, reset=118008)], store)
+        run(store, codex, 'continue', armed=True, continuous=True,
+            sleep=lambda _: None, notifier=chat)
+        self.assertEqual([e['kind'] for e in chat.events],
+                         ['trigger_requested', 'reset_confirmed'])
+        self.assertEqual(chat.events[1]['reset'], 118008)
+        again = FakeCodex([pair('active', at=100400, reset=118008)])
+        run(store, again, 'continue', armed=True, continuous=True, notifier=chat)
+        self.assertEqual(len(chat.events), 2)
+        self.assertEqual(again.sends, 0)
+
+    def test_chat_failure_does_not_resend_model_and_retries_saved_events(self):
+        class Offline:
+            def send(self, event):
+                raise OSError('private response or token must not be saved')
+
+        store = Store({'expected_reset': 99000, 'armed_at': 1})
+        codex = FakeCodex([pair('idle'), pair('idle', at=100008),
+                           pair('active', at=100030, reset=118008)], store)
+        run(store, codex, 'continue', armed=True, continuous=True,
+            sleep=lambda _: None, notifier=Offline())
+        self.assertEqual(store.state['status'], 'complete')
+        self.assertEqual(codex.sends, 1)
+        self.assertTrue(all(e['status'] == 'pending' for e in store.state['chat_events']))
+        self.assertNotIn('private response', str(store.state))
+
+        class Online:
+            events = []
+
+            def send(self, event):
+                self.events.append(event['id'])
+                return 'https://chatgpt.com/c/test-chat'
+
+        online = Online()
+        again = FakeCodex([pair('active', at=100400, reset=118008)])
+        run(store, again, 'continue', armed=True, continuous=True, notifier=online)
+        self.assertEqual(len(online.events), 2)
+        self.assertTrue(all(e['status'] == 'accepted' for e in store.state['chat_events']))
+        self.assertEqual(again.sends, 0)
+
+    def test_changed_active_deadline_is_recorded_without_model_message(self):
+        store = Store({'status': 'complete', 'armed_at': 1,
+                       'verified_reset': 118008, 'verified_at': 100030,
+                       'expected_reset': 118008})
+        codex = FakeCodex([pair('active', at=110000, reset=120000)])
+        run(store, codex, 'continue', armed=True, continuous=True)
+        self.assertEqual(codex.sends, 0)
+        self.assertEqual(store.state['expected_reset'], 120000)
+        self.assertEqual(store.state['chat_events'][0]['kind'], 'deadline_changed')
+        self.assertEqual(store.state['chat_events'][0]['reset'], 120000)
 
     def test_continuous_observation_and_disarmed_runs_do_not_retire_cycle(self):
         for mode, armed in (('observe', True), ('continue', False)):

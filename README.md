@@ -8,8 +8,10 @@ reste nécessaire ; le mettre à `false` suspend les envois.
 Chaque cycle attend la fin de la fenêtre réellement observée puis au moins
 cinq minutes, relit le quota juste avant un seul message et vérifie la nouvelle
 échéance. Une fenêtre active démarrée par l’utilisateur est suivie sans envoi.
-Seul un cycle `complete` avec une confirmation et une échéance expirée peut
-être archivé pour le cycle suivant. Les 100 derniers reçus sont conservés dans
+Seul un cycle `complete` avec une confirmation et deux nouvelles lectures
+inactives peut être archivé pour le cycle suivant. Un reset anticipé observé
+démarre le délai de cinq minutes à sa détection, sans attendre l’ancienne échéance.
+Les 100 derniers reçus sont conservés dans
 `completed_cycles`. `pending` ou `unverified` bloque tout nouvel envoi et fait
 échouer le run pour rendre le problème visible. Aucun retry de message.
 
@@ -22,6 +24,53 @@ ne garantit pas une heure exacte. Notifications d’échec Actions à surveiller
 
 Les notes ci-dessous décrivent le test initial et la configuration des secrets ;
 leurs restrictions « un seul essai / 24 heures » concernent le mode test uniquement.
+
+## Livraison directe dans un chat (préparée, non connectée)
+
+Le message qui démarre la fenêtre vient de `codex exec` sur le runner GitHub.
+Le rappel ChatGPT personnel ne démarre pas cet appel. Le script ne dispose
+d’aucun accès pour modifier ce rappel ou publier dans son ancienne conversation.
+Le contrôleur suit lui-même les changements d’échéance à chaque passage ; il
+n’a pas besoin d’un rappel fixe toutes les cinq heures pour envoyer sa requête.
+
+Un adaptateur optionnel utilise l’API officielle des Workspace Agents :
+<https://learn.chatgpt.com/workspace-agents/trigger-runs>.
+Il exige un agent publié avec un canal API et un jeton d’accès propre à cet
+agent. La disponibilité dépend du compte/espace de travail. Ce n’est pas une
+clé API de modèles, et les identifiants Codex ne servent pas à cette connexion.
+Il ne permet pas de reprendre une conversation personnelle ChatGPT/Codex
+existante : une clé stable conserve tous les événements dans un nouveau chat
+de cet agent. La réponse `202` prouve la mise en file, pas la livraison finale
+d’une notification push ou le succès de l’agent.
+
+Configuration Actions à renseigner uniquement après publication de l’agent :
+
+| Type | Nom | Valeur |
+| --- | --- | --- |
+| Variable | `QUOTA_CHAT_TRIGGER_ID` | Identifiant du canal API publié, `agtch_…` |
+| Variable | `QUOTA_CHAT_CONVERSATION_KEY` | Clé stable, par exemple `codex-quota-reset` |
+| Secret | `QUOTA_CHAT_ACCESS_TOKEN` | Jeton Workspace Agent, saisi dans les paramètres sécurisés GitHub |
+| Variable | `QUOTA_CHAT_ENABLED` | `true` seulement lorsque les trois valeurs sont prêtes |
+
+Instruction conseillée pour cet agent : « Pour chaque événement du contrôleur,
+recopie uniquement son message. N’utilise aucun outil, ne programme rien et
+ne déclenche aucun autre appel Codex. »
+
+Le même chat reçoit dans l’ordre la demande de déclenchement, puis l’échéance
+vérifiée en heure de Paris dès que le contrôleur la confirme. Les changements
+d’échéance et les resets anticipés observés produisent aussi des événements.
+Le script ne peut pas attribuer un changement à une annonce ou à une personne.
+Les événements sont sauvegardés avant leur livraison. Une erreur de réseau
+conserve l’événement pour un nouveau passage avec la même clé d’idempotence,
+sans répéter la requête Codex. Une erreur de notification ne bloque pas les
+lectures nécessaires à la vérification du quota. Le jeton de notification ne
+fait pas partie de l’environnement transmis à Codex.
+
+Avant activation définitive de cette livraison, vérifier un cycle réel et les
+deux messages dans le chat retourné sous `chat_events[].conversation_url`.
+Puis suspendre les anciens rappels séparés pour éviter des messages concurrents.
+Sans ces nouvelles valeurs, l’adaptateur reste désactivé et aucune livraison
+immédiate dans ChatGPT ne doit être annoncée comme opérationnelle.
 
 # Test des fenêtres Codex avec ChatGPT Plus
 

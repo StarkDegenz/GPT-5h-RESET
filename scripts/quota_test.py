@@ -104,8 +104,13 @@ def advance_cycle(state, first, second):
         state['expected_reset'] = second.reset
         state.pop('idle_since', None)
         return state
-    if kind != 'idle' or first.at < deadline or second.at < deadline:
+    # Proven idle readings can indicate an early/global reset. The old receipt
+    # must not keep the controller blocked until its now-obsolete deadline.
+    if kind != 'idle':
         return state
+    if second.at < deadline:
+        queue_chat_event(state, 'early_reset_detected',
+                         f'early-reset:{int(second.at)}', second.at)
     fields = ('attempt_at', 'attempt_id', 'cli_ok', 'cli_finished_at',
               'verified_at', 'verified_reset', 'verification_offset_seconds',
               'verification_read_errors', 'verification_failure')
@@ -343,7 +348,41 @@ def record_pair(store, state, phase, first, second, decision):
     store.save(state)
 
 
-def verify_attempt(store, codex, state, expected_account, sleep, clock):
+def queue_chat_event(state, kind, event_id, at, reset=None):
+    """Durable, sanitized outbox; delivery never authorizes a model retry."""
+    events = state.get('chat_events', [])
+    if any(event['id'] == event_id for event in events):
+        return
+    event = {'id': event_id, 'kind': kind, 'at': int(at), 'status': 'pending'}
+    if reset is not None:
+        event['reset'] = reset
+    # Keep all unaccepted events and a bounded delivery receipt history.
+    pending = [item for item in events if item['status'] != 'accepted']
+    accepted = [item for item in events if item['status'] == 'accepted'][-99:]
+    state['chat_events'] = [*accepted, *pending, event]
+
+
+def deliver_chat_events(store, state, notifier):
+    if notifier is None:
+        return
+    for event in state.get('chat_events', []):
+        if event['status'] == 'accepted':
+            continue
+        try:
+            receipt = notifier.send(event)
+        except (OSError, ValueError):
+            # Raw HTTP errors may contain headers or tokens. Keep generic status.
+            state['chat_delivery_error'] = 'delivery_unconfirmed'
+            store.save(state)
+            print('Chat delivery unconfirmed; queued for idempotent retry, no model resend.')
+            return
+        event['status'] = 'accepted'
+        event['conversation_url'] = receipt
+        state.pop('chat_delivery_error', None)
+        store.save(state)
+
+
+def verify_attempt(store, codex, state, expected_account, sleep, clock, notifier=None):
     """Retry quota reads only. A second model call is never made here."""
     started = clock()
     expected = state['attempt_at'] + 18000
@@ -375,9 +414,13 @@ def verify_attempt(store, codex, state, expected_account, sleep, clock):
         if kind == 'active' and abs(second.reset - expected) <= 180:
             state['status'] = 'complete'
             state['verified_reset'] = second.reset
+            state['chat_observed_reset'] = second.reset
             state['verified_at'] = int(second.at)
             state['verification_offset_seconds'] = offset
+            queue_chat_event(state, 'reset_confirmed',
+                             'confirmed:' + state['attempt_id'], second.at, second.reset)
             store.save(state)
+            deliver_chat_events(store, state, notifier)
             print('Cycle complete: a stable five-hour deadline was observed after the request.')
             print('Compare this deadline with the account UI; concurrent use cannot be ruled out by code.')
             return 'complete'
@@ -388,8 +431,10 @@ def verify_attempt(store, codex, state, expected_account, sleep, clock):
 
 
 def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
-        clock=time.monotonic, continuous=False):
+        clock=time.monotonic, continuous=False, notifier=None):
     state = store.load()
+    if mode == 'continue' and armed:
+        deliver_chat_events(store, state, notifier)
     if continuous and mode == 'test':
         raise Blocked('Disable continuous mode before arming a new one-shot test.')
     if mode == 'test':
@@ -405,10 +450,22 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
             state.pop('idle_since', None)
         store.save(state)
     first, second = codex.pair()
+    previous_deadline = state.get('expected_reset')
     if continuous and mode == 'continue' and armed:
         state = advance_cycle(state, first, second)
     updated, decision = decide(state, first, second)
+    if mode == 'continue' and armed and decision in ('active', 'complete'):
+        if classify(first, second) == 'active':
+            previous = updated.get('chat_observed_reset', previous_deadline)
+            if (previous is not None and previous != updated.get('fictional_baseline')
+                    and abs(previous - second.reset) > 2):
+                queue_chat_event(updated, 'deadline_changed',
+                                 f'deadline:{int(second.at)}:{second.reset}',
+                                 second.at, second.reset)
+            updated['chat_observed_reset'] = second.reset
     record_pair(store, updated, 'observation', first, second, decision)
+    if mode == 'continue' and armed:
+        deliver_chat_events(store, updated, notifier)
     print(f'Observation: {decision}; observed deadline UTC: {iso(second.reset)}')
     if updated.get('resync_to') and updated.get('resync_to') != state.get('resync_to'):
         print(f'Realigned: {iso(updated["resync_from"])} -> {iso(updated["resync_to"])}')
@@ -431,15 +488,22 @@ def run(store, codex, mode, baseline=None, armed=False, sleep=time.sleep,
     updated['status'] = 'pending'
     updated['attempt_at'] = int(before_second.at)
     updated['attempt_id'] = os.environ.get('GITHUB_RUN_ID', 'local')
+    queue_chat_event(updated, 'trigger_requested',
+                     'trigger:' + updated['attempt_id'], before_second.at)
     store.save(updated)
     updated['cli_ok'] = codex.warm()
     updated['cli_finished_at'] = int(time.time())
     store.save(updated)
+    deliver_chat_events(store, updated, notifier)
     # A CLI error can occur after metering. Observe for delayed updates, never resend.
-    return verify_attempt(store, codex, updated, before_second.account, sleep, clock)
+    return verify_attempt(store, codex, updated, before_second.account, sleep, clock, notifier)
 
 
 def main():
+    if __package__:
+        from .chat_notify import WorkspaceChat
+    else:
+        from chat_notify import WorkspaceChat
     mode = os.environ.get('MODE', 'observe')
     if mode not in ('observe', 'test', 'continue'):
         raise Blocked('Unknown mode.')
@@ -448,7 +512,8 @@ def main():
         raise Blocked('A fictional baseline is only accepted when arming the one-shot test.')
     run(GitHubState(), Codex(), mode, baseline,
         armed=os.environ.get('QUOTA_TEST_ARMED') == 'true',
-        continuous=os.environ.get('QUOTA_CONTINUOUS_ENABLED') == 'true')
+        continuous=os.environ.get('QUOTA_CONTINUOUS_ENABLED') == 'true',
+        notifier=WorkspaceChat.from_environment())
 
 
 if __name__ == '__main__':
