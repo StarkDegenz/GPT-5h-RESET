@@ -25,6 +25,7 @@ jobs:
   controller:
     # Runs on every external tick, without any ChatGPT or PAT secret.
     if: >-
+      false &&
       github.event.repository.private == false &&
       github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-24.04
@@ -47,7 +48,7 @@ jobs:
 
   quota:
     needs: controller
-    if: needs.controller.outputs.run_quota == 'true'
+    if: ${{ false }} # Disabled at the user's request.
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     permissions:
